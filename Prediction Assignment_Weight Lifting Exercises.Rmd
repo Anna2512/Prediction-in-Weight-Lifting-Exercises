@@ -1,0 +1,542 @@
+---
+title: "Prediction in Weight Lifting Exercises"
+author: "Anna Huynh"
+date: "1/12/2021"
+output: html_document
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Synopsis
+
+  This is a project towards scientific research of human activity recognition, which is focused on discriminating between different human activities (sitting/standing/walking etc.). The approach we propose for Weight Lifting Exercises for the sake of investigating how well an activity performed by the device wearer. Therefore, we might predict the manner in which they did exercise rather than only quantify how much of a particular activity they do, i.e. sports training, clinical training and so on.
+  
+  The goal of our first experiment was to assess whether we could detect mistakes in weight-lifting exercises of 06 participants in the study. In particular, the algorithm we made is eventually to predict which exercise participants took throughout 17 important indicators (let's see how we figured out 17 amongst 160 features of data-set) reported by a sensor device worn by themselves.
+
+  The write-up will walk you through the following pinpoints:
+  
+- How we build the model to learn the mapping from input to output.
+- How we used cross-validation to understand how well the model will perform.
+- What we think the expected out of sample error is.
+- Why we made the choices.
+
+  Eventually, we use our prediction model to forecast which exercise (class) applied in 20 different test cases, where we don't actually know the outcomes. The links are enclosed.
+
+Training Data : https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+Testing Data: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+Data is collected from the study, whereas 06 participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: 
+- 1. Exactly according to the specification (***Class A***)
+- 2. Throwing the elbows to the front (***Class B***)
+- 3. Lifting the dumbbell only halfway (***Class C***) 
+- 4. Lowering the dumbbell only halfway (***Class D***)
+- 5. Throwing the hips to the front (***Class E***)
+
+More information is available from the website here:
+http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+**This data-set is licensed under the Creative Commons license (CC BY-SA).**
+
+
+## 1. Getting Data
+
+```{r}
+library(readr)
+
+train_pml <- read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+test_pml <- read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+
+head(train_pml)
+
+dim(train_pml)
+dim(test_pml)
+
+```
+
+## 2. Exploratory Data Analysis
+
+### 2.1. Missing Values
+
+```{r}
+# Compute total missing values in each column
+data.frame(colSums(is.na(train_pml)))[1:20,]
+
+```
+```{r}
+library(naniar)
+
+# Plot missing data 
+train_pml %>%
+  slice(1:1000) %>%
+  vis_miss()
+
+```
+
+***Figure 01: Plot of missing values tells us of an imbalanced data-set***
+
+#### 2.2. How have the number of specifications ("classe") changed per type of exercises?
+
+```{r}
+library(ggthemes)
+ 
+# Need to make a new transformed data-set for this visualization
+ 
+(
+  classe_table <- train_pml %>%
+    count(classe = factor(classe)) %>% 
+    mutate(pct = prop.table(n)) %>%
+    arrange(-pct) %>% 
+    tibble()
+)
+  
+  ggplot(
+  classe_table %>% filter(classe != "NA"),
+  mapping = aes(
+    x = reorder(classe, n),
+    y = pct,
+    group = 1,
+    label = scales::percent(pct)
+  )
+) +
+  theme_fivethirtyeight() +
+  geom_bar(stat = "identity",
+           fill = "#634832") +
+  geom_text(position = position_dodge(width = 0.9),
+            # move to center of bars
+            hjust = -0.05,
+            #Have Text just above bars
+            size = 2.5) +
+  labs(x = "Classes of Exercise",
+       y = "Proportion of Dataset") +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  )) +
+  ggtitle("Classes of Exercise Listed in Weight Lifting Dataset") +
+  scale_y_continuous(labels = scales::percent) +                
+  coord_flip()
+
+```
+
+***Figure 02: Class A of exercise (exactly according to the specification) dominated as compared to other classes in the data-set.***
+
+
+#### 2.3. How have the number of exercises varied over days?
+
+```{r}
+df <- train_pml %>%
+  mutate(train_date = as_datetime(raw_timestamp_part_1))
+
+df <- df %>%
+  group_by(train_date) %>%
+  count(classe = factor(classe)) %>%
+  summarise(y = sum(n), .groups = "drop")
+
+head(df)
+
+```
+
+```{r}
+library(plotly)
+
+plot_ly(data = df,
+        x = ~ train_date,
+        y = ~ y,
+        type = "scatter", 
+        mode = "line",
+        name = "Number of Exercises") %>%
+  layout(title = "Total Number of Weight Lifting Exercises per Day",
+         yaxis = list(title = "Number of Exercises"),
+         xaxis = list(title = "Source: Weight Lifting Dataset"))
+
+```
+
+***Figure 03: Number of exercises varied over days***
+
+#### 2.4. Important Features Selection
+
+We divided into 04 groups of exercises for quantitative assessment, they are:
+- belt
+- arm
+- dumbbell
+- forearm
+
+```{r}
+library(randomForest)
+library(caret)
+
+# belt
+train_pml_belt <- train_pml %>%
+        select( classe, roll_belt, pitch_belt, yaw_belt, total_accel_belt,
+               var_total_accel_belt, gyros_belt_x, gyros_belt_y, gyros_belt_z,
+               accel_belt_x, accel_belt_y, accel_belt_z, magnet_belt_x,
+               magnet_belt_y, magnet_belt_z ) %>%
+        arrange(classe) %>%
+        na.omit()
+       
+
+train_pml_belt$classe <- as.factor(as.character(train_pml_belt$classe))
+
+modBelt <- randomForest(classe ~., data = train_pml_belt)
+order(varImp(modBelt), decreasing=TRUE)
+
+```
+```{r}
+# Calculate the number of principle components needed to capture 90% of the variance
+preProc_belt <- preProcess(train_pml_belt, method="pca", thresh=0.9)
+preProc_belt
+
+```
+
+***Observation:***
+ There are 09 important features extracted in the belt exercises, including: pitch_belt, total_accel_belt, classe, roll_belt, magnet_belt_x, magnet_belt_y,
+ accel_belt_z, accel_belt_y, gyros_belt_z.
+ 
+ 
+```{r}
+# arm
+train_pml_arm <- train_pml %>%
+        select( classe, roll_arm, pitch_arm, yaw_arm, total_accel_arm,
+              gyros_arm_x, gyros_arm_y, gyros_arm_z, accel_arm_x, accel_arm_y,
+              accel_arm_z, magnet_arm_x, magnet_arm_y, magnet_arm_z
+              ) %>%
+        arrange(classe) %>%
+        na.omit()
+
+train_pml_arm$classe <- as.factor(as.character(train_pml_arm$classe))
+
+modArm <- randomForest(classe ~., data = train_pml_arm)
+order(varImp(modArm), decreasing=TRUE)
+
+```
+
+```{r}
+# Calculate the number of principle components needed to capture 90% of the variance
+preProc_arm <- preProcess(train_pml_arm, method="pca", thresh=0.9)
+preProc_arm
+
+```
+
+***Observation:***
+ There are 11 important features extracted in the arm exercises, including:
+ classe, roll_arm, magnet_arm_x, accel_arm_y, gyros_arm_z, total_accel_arm,
+ pitch_arm, accel_arm_x, accel_arm_z, gyros_arm_x, magnet_arm_y.
+ 
+ 
+```{r}
+# dumbbell
+train_pml_dumbbell <- train_pml %>%
+        select( classe, roll_dumbbell, pitch_dumbbell, yaw_dumbbell,
+                total_accel_dumbbell, gyros_dumbbell_x, gyros_dumbbell_y,
+                gyros_dumbbell_z, accel_dumbbell_x, accel_dumbbell_y,
+                accel_dumbbell_z, magnet_dumbbell_x, magnet_dumbbell_y,
+                magnet_dumbbell_z ) %>%
+        arrange(classe) %>%
+        na.omit()
+
+train_pml_dumbbell$classe <- as.factor(as.character(train_pml_dumbbell$classe))
+
+modDum <- randomForest(classe ~., data = train_pml_dumbbell)
+order(varImp(modDum), decreasing=TRUE)
+
+```
+
+```{r}
+# Calculate the number of principle components needed to capture 90% of the variance
+preProc_dumb <- preProcess(train_pml_dumbbell, method="pca", thresh=0.9)
+preProc_dumb
+
+```
+
+***Observation:***
+ There are 9 important features extracted in the dumbbell, including:
+ magnet_dumbbell_y, magnet_dumbbell_x, accel_dumbbell_z, accel_dumbbell_y,
+ accel_dumbbell_x, gyros_dumbbell_x, classe, pitch_dumbbell, total_accel_dumbbell.
+ 
+ 
+```{r}
+# forearm
+train_pml_for <- train_pml %>%
+        select( classe, roll_forearm, pitch_forearm, yaw_forearm,
+                total_accel_forearm, gyros_forearm_x, gyros_forearm_y,
+                gyros_forearm_z, accel_forearm_x, accel_forearm_y,
+                accel_forearm_z, magnet_forearm_x, magnet_forearm_y,
+                magnet_forearm_z ) %>%
+        arrange(classe) %>%
+        na.omit()
+
+train_pml_for$classe <- as.factor(as.character(train_pml_for$classe))
+
+modFor <- randomForest(classe ~., data = train_pml_for)
+order(varImp(modFor), decreasing=TRUE)
+
+```
+
+```{r}
+# Calculate the number of principle components needed to capture 90% of the variance
+preProc_for <- preProcess(train_pml_for, method="pca", thresh=0.9)
+preProc_for
+```
+
+***Observation:***
+ There are 12 important features extracted in the forearm exercises, including:
+roll_forearm, classe, magnet_forearm_y, gyros_forearm_z, accel_forearm_y,
+magnet_forearm_x, gyros_forearm_x, pitch_forearm, accel_forearm_z, accel_forearm_x,
+gyros_forearm_y, yaw_forearm.
+
+
+## 3. Build a model
+
+### 3.1. Split the data and create cross-validation bootstraps.
+
+#### Unify important features from 04 groups (belt, arm, dumbbell, and forearm)
+
+```{r}
+library(caret)
+set.seed(2021)
+
+# Prepare data
+sub_pml <- train_pml %>%
+  select(classe, pitch_belt, total_accel_belt, roll_belt, magnet_belt_x, 
+         magnet_belt_y, accel_belt_z, accel_belt_y, gyros_belt_z,
+         roll_arm, magnet_arm_x, accel_arm_y, gyros_arm_z, total_accel_arm,
+         pitch_arm, accel_arm_x, accel_arm_z, gyros_arm_x, magnet_arm_y,
+         magnet_dumbbell_y, magnet_dumbbell_x, accel_dumbbell_z, accel_dumbbell_y,
+         accel_dumbbell_x, gyros_dumbbell_x, pitch_dumbbell, total_accel_dumbbell,
+         roll_forearm, magnet_forearm_y, gyros_forearm_z, accel_forearm_y,
+         magnet_forearm_x, gyros_forearm_x, pitch_forearm, accel_forearm_z,
+         accel_forearm_x, gyros_forearm_y, yaw_forearm,
+         kurtosis_roll_dumbbell ) %>%
+  na.omit()
+
+
+sub_pml$classe <- as.factor(as.character(sub_pml$classe))
+
+```
+
+```{r}
+# Reassess important features 
+modSub <- randomForest(classe ~., data = sub_pml)
+order(varImp(modSub), decreasing=TRUE)
+
+```
+```{r}
+# Calculate the number of principle components needed to capture 90% of the variance
+preProc_sub <- preProcess(sub_pml, method="pca", thresh=0.9)
+preProc_sub
+
+```
+
+ ***We eventually picked up 17 features from ordered important variables after reassessment.***
+ They are: classe, total_accel_belt, gyros_forearm_x, magnet_arm_y,
+         magnet_belt_x, accel_dumbbell_z,
+         total_accel_dumbbell, magnet_dumbbell_y, magnet_belt_y, roll_arm,
+         gyros_belt_z, gyros_dumbbell_x, gyros_arm_x, accel_forearm_y,
+         accel_dumbbell_y, pitch_forearm, accel_forearm_z.
+
+
+```{r}
+library(corrplot)
+library(Hmisc)
+library(ggcorrplot)
+
+# Plot correlation matrix
+train_pml_cor <- sub_pml %>%
+  select(total_accel_belt, gyros_forearm_x, magnet_arm_y,
+         magnet_belt_x, accel_dumbbell_z,
+         total_accel_dumbbell, magnet_dumbbell_y, magnet_belt_y, roll_arm,
+         gyros_belt_z, gyros_dumbbell_x, gyros_arm_x, accel_forearm_y,
+         accel_dumbbell_y, pitch_forearm, accel_forearm_z )
+         
+pmlData <- cor(train_pml_cor)
+head(round(pmlData,2))
+
+cormat <- pmlData
+ggcorrplot::ggcorrplot(cormat, title = "Correlation of Extracted Variables")
+
+```
+
+***Figure 04: Correlation Matrix of important features***
+
+
+```{r}
+# Get some colors with Heatmap
+col <- colorRampPalette(c("darkblue", "white", "darkorange"))(25)
+pml_hea <- cor(train_pml_cor)
+heatmap(x = pml_hea, col = col, symm = TRUE)
+
+```
+
+
+#### 3.2. Cross-validation:
+
+```{r}
+# Final features for training
+fin_pml <- sub_pml %>%
+  select(classe, total_accel_belt, gyros_forearm_x, magnet_arm_y,
+         magnet_belt_x, accel_dumbbell_z,
+         total_accel_dumbbell, magnet_dumbbell_y, magnet_belt_y, roll_arm,
+         gyros_belt_z, gyros_dumbbell_x, gyros_arm_x, accel_forearm_y,
+         accel_dumbbell_y, pitch_forearm, accel_forearm_z )
+
+```
+
+```{r}
+library(tidymodels)
+
+# Split the data
+set.seed(2021)
+pml_split <- initial_split(fin_pml, strata = classe)
+pml_train <- training(pml_split) # training set
+pml_test <- testing(pml_split) # validation set
+
+```
+
+
+```{r}
+# Create cross-validation bootstraps.
+pml_train %>%
+  count(classe)
+
+set.seed(123)
+pml_folds <- pml_train %>%
+  mutate(classe = factor(classe)) %>%
+  bootstraps()
+
+pml_folds
+
+```
+
+#### Let’s create a random forest model and set up a model workflow with the model and a formula pre-processor.
+
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+pml_wf <- workflow() %>%
+  add_formula(classe ~.) %>%
+  add_model(rf_spec)
+
+pml_wf
+
+```
+
+#### Let’s fit the random forest model to the bootstrap re-samples.
+
+```{r}
+library(ranger)
+
+doParallel::registerDoParallel()
+pml_rs <- fit_resamples(
+  pml_wf,
+  resamples = pml_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+
+pml_rs
+
+```
+
+#### 3.3. Model Evaluation
+
+```{r}
+collect_metrics(pml_rs)
+
+```
+
+#### Let’s now fit to the entire training set and evaluate on the testing set.
+  
+```{r}
+pml_fit <- last_fit(pml_wf, pml_split)
+collect_metrics(pml_fit)
+
+```
+
+***Observation: Model's accuracy increased from 62% to 72% after fitting.***
+
+```{r}
+pml_rs %>%
+  collect_predictions() %>%
+  group_by(id) %>%
+  ppv(classe, .pred_class)
+
+```
+
+#### 3.4. The expected out of sample error
+
+```{r}
+dim(pml_train) # training test size
+collect_metrics(pml_rs)$n # number of bootstraps
+
+```
+
+ For training set had 303 observations, 25 boots cross validation would estimate the performance over a training size of about 290 (**the size of the expected generalization error of a training algorithm producing models out-of-samples**) which is virtually the same as the performance for training set size of 303. Thus cross-validation would not suffer from much bias. In the other words, increasing number of boots to larger values will lead to the ***bias*** in the estimate of out-of-sample (test set) accuracy ***smaller*** and the ***variance*** in the estimate of out-of-sample (test set) accuracy ***bigger***.
+
+
+#### Next, let’s compute ROC curves for each class.
+
+```{r}
+pml_rs %>%
+  collect_predictions() %>%
+  group_by(id) %>%
+  roc_curve(classe, .pred_A:.pred_E ) %>%
+  ggplot(aes(1 - specificity, sensitivity, color = id)) +
+  geom_abline(lty = 2, color = "gray80", size = 1.5) +
+  geom_path(show.legend = FALSE, alpha = 0.6, size = 1.2) +
+  facet_wrap(~.level, ncol = 5) +
+  coord_equal()
+
+```
+
+***Figure 05: Plots describe ROC curve from each class of exercise***
+
+***Observation: We have an ROC curve for each class and each re-sample in this plot. Notice that the points of class were easy for the model to identify.***
+
+
+```{r}
+pml_rs %>%
+  collect_predictions() %>%
+  filter(.pred_class != classe) %>%
+  conf_mat(classe, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+```
+
+***Figure 06 : Confusion Matrix of prediction and truth observations*** 
+
+***Observation: The classes in weight lifting data-set was confused with many of the other classes, whereas class A was often confused with class C.***
+
+
+### 4. Trained model applies to validation data-set
+
+```{r}
+# Save model
+pml_wf_model <- pml_fit$.workflow[[1]]
+
+# predict on testing set
+predict(pml_wf_model, pml_test[90, ])
+
+
+```
+
+### 5. Predict class of exercise in 20 test cases
+
+```{r}
+predict(pml_wf_model, test_pml)
+
+```
+
+
+
